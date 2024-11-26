@@ -14,6 +14,7 @@ from torchvision import transforms
 from basic_conv import *
 from example.model.smooth_cross_entropy import smooth_crossentropy
 from example.utility.bypass_bn import enable_running_stats, disable_running_stats
+import torch
 
 def cosine_anneal_schedule(t, nb_epoch, lr):
     cos_inner = np.pi * (t % (nb_epoch))
@@ -24,13 +25,12 @@ def cosine_anneal_schedule(t, nb_epoch, lr):
 
 def test(net, criterion, batch_size, test_path):
     net.eval()
-    use_cuda = torch.cuda.is_available()
     test_loss = 0
     correct = 0
     correct_com = 0
     total = 0
     idx = 0
-    device = torch.device("cuda")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     transform_test = transforms.Compose([
         transforms.Resize((550, 550)),
@@ -40,31 +40,33 @@ def test(net, criterion, batch_size, test_path):
     ])
     testset = torchvision.datasets.ImageFolder(root=test_path,
                                                transform=transform_test)
-    testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size, shuffle=True, num_workers=4)
+    testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size, 
+                                           shuffle=True, 
+                                           num_workers=4,
+                                           pin_memory=True)
 
-    for batch_idx, (inputs, targets) in enumerate(testloader):
-        idx = batch_idx
-        if use_cuda:
+    with torch.no_grad():
+        for batch_idx, (inputs, targets) in enumerate(testloader):
+            idx = batch_idx
             inputs, targets = inputs.to(device), targets.to(device)
-        inputs, targets = Variable(inputs, volatile=True), Variable(targets)
-        output_1, output_2, output_3, output_ORI, map1, map2, map3 = net(inputs)
+            output_1, output_2, output_3, output_ORI, map1, map2, map3 = net(inputs)
 
-        outputs_com = output_1 + output_2 + output_3 + output_ORI
+            outputs_com = output_1 + output_2 + output_3 + output_ORI
 
-        loss = criterion(output_ORI, targets).mean()
+            loss = criterion(output_ORI, targets).mean()
 
-        test_loss += loss.item()
-        _, predicted = torch.max(output_ORI.data, 1)
-        _, predicted_com = torch.max(outputs_com.data, 1)
+            test_loss += loss.item()
+            _, predicted = torch.max(output_ORI.data, 1)
+            _, predicted_com = torch.max(outputs_com.data, 1)
 
-        total += targets.size(0)
-        correct += predicted.eq(targets.data).cpu().sum()
-        correct_com += predicted_com.eq(targets.data).cpu().sum()
+            total += targets.size(0)
+            correct += predicted.eq(targets.data).cpu().sum()
+            correct_com += predicted_com.eq(targets.data).cpu().sum()
 
-        if batch_idx % 50 == 0:
-            print('Step: %d | Loss: %.3f |Combined Acc: %.3f%% (%d/%d)' % (
-            batch_idx, test_loss / (batch_idx + 1),
-            100. * float(correct_com) / total, correct_com, total))
+            if batch_idx % 50 == 0:
+                print('Step: %d | Loss: %.3f |Combined Acc: %.3f%% (%d/%d)' % (
+                batch_idx, test_loss / (batch_idx + 1),
+                100. * float(correct_com) / total, correct_com, total))
 
     test_acc_en = 100. * float(correct_com) / total
     test_loss = test_loss / (idx + 1)
@@ -246,12 +248,16 @@ def train(nb_epoch, batch_size, store_name, num_class=0, start_epoch=0, data_pat
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
     ])
     trainset = torchvision.datasets.ImageFolder(root=data_path+'/train', transform=transform_train)
-    trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=1)
+    trainloader = torch.utils.data.DataLoader(
+        trainset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=4,  # 시스템에 맞게 조정
+        pin_memory=True
+    )
 
 
-    net = torchvision.models.resnet50()
-    state_dict = load_state_dict_from_url('https://download.pytorch.org/models/resnet50-19c8e357.pth')
-    net.load_state_dict(state_dict)
+    net = torchvision.models.resnet50(weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V1)
     fc_features = net.fc.in_features
     net.fc = nn.Linear(fc_features, num_class)
 
@@ -263,8 +269,8 @@ def train(nb_epoch, batch_size, store_name, num_class=0, start_epoch=0, data_pat
     netp = torch.nn.DataParallel(net, device_ids=[0])
 
 
-
-    device = torch.device("cuda")
+    print(torch.cuda.is_available())
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net.to(device)
     decoder1 = Anti_Noise_Decoder(1, 512).to(device)
     decoder2 = Anti_Noise_Decoder(2, 1024).to(device)
@@ -318,11 +324,9 @@ def train(nb_epoch, batch_size, store_name, num_class=0, start_epoch=0, data_pat
             idx = batch_idx
             if inputs.shape[0] < batch_size:
                 continue
-            if use_cuda:
-                inputs, targets = inputs.to(device), targets.to(device)
-            inputs, targets = Variable(inputs), Variable(targets)
-
-
+            
+            inputs, targets = inputs.to(device), targets.to(device)
+            
             for nlr in range(len(optimizer.param_groups)):
                 optimizer.param_groups[nlr]['lr'] = cosine_anneal_schedule(epoch, nb_epoch, lr[nlr])
 
@@ -540,7 +544,7 @@ def train(nb_epoch, batch_size, store_name, num_class=0, start_epoch=0, data_pat
 
 
 if __name__ == '__main__':
-    data_path = '<The-Path-To>/Stanford Cars'
+    data_path = '/data/Stanford_Cars'
     if not os.path.isdir('results'):
         os.mkdir('results')
     train(nb_epoch=200,             # number of epoch
