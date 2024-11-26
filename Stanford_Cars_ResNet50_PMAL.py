@@ -1,6 +1,6 @@
 from __future__ import print_function
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import torchvision.models
 from sam import SAM
 from torch.utils.model_zoo import load_url as load_state_dict_from_url
@@ -15,6 +15,13 @@ from basic_conv import *
 from example.model.smooth_cross_entropy import smooth_crossentropy
 from example.utility.bypass_bn import enable_running_stats, disable_running_stats
 import torch
+import matplotlib.pyplot as plt
+from torch.utils.tensorboard import SummaryWriter
+import time
+from datetime import datetime
+from tqdm import tqdm
+import torch.backends.cudnn as cudnn
+from torch.amp import autocast, GradScaler
 
 def cosine_anneal_schedule(t, nb_epoch, lr):
     cos_inner = np.pi * (t % (nb_epoch))
@@ -253,11 +260,24 @@ def train(nb_epoch, batch_size, store_name, num_class=0, start_epoch=0, data_pat
         batch_size=batch_size, 
         shuffle=True, 
         num_workers=4,  # 시스템에 맞게 조정
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2
     )
 
 
-    net = torchvision.models.resnet50(weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V1)
+    # CUDA 최적화 설정
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    cudnn.benchmark = True
+    
+    # Mixed Precision Training을 위한 scaler 초기화
+    scaler = GradScaler()
+
+    # Tensorboard 설정
+    writer = SummaryWriter(f'runs/{store_name}_{datetime.now().strftime("%Y%m%d-%H%M%S")}')
+
+    # 모델 초기화
+    net = torchvision.models.resnet50(weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V2)
     fc_features = net.fc.in_features
     net.fc = nn.Linear(fc_features, num_class)
 
@@ -266,17 +286,17 @@ def train(nb_epoch, batch_size, store_name, num_class=0, start_epoch=0, data_pat
     net_layers = net_layers[0:8]
     net = Network_Wrapper(net_layers, num_class, classifier)
 
-    netp = torch.nn.DataParallel(net, device_ids=[0])
+    # Multi-GPU 설정
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs!")
+        netp = torch.nn.DataParallel(net)
+    else:
+        netp = net
 
-
-    print(torch.cuda.is_available())
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    net.to(device)
+    netp = netp.to(device)
     decoder1 = Anti_Noise_Decoder(1, 512).to(device)
     decoder2 = Anti_Noise_Decoder(2, 1024).to(device)
     decoder3 = Anti_Noise_Decoder(4, 2048).to(device)
-
-
 
     CB_loss = CharbonnierLoss()
 
@@ -309,24 +329,23 @@ def train(nb_epoch, batch_size, store_name, num_class=0, start_epoch=0, data_pat
     max_val_acc = 0
     lr = [0.002, 0.002, 0.002, 0.002, 0.002, 0.002, 0.002,  0.002, 0.002,  0.002, 0.002,  0.002, 0.002, 0.0002]
     for epoch in range(start_epoch, nb_epoch):
-        print('\nEpoch: %d' % epoch)
+        print(f'\nEpoch: {epoch}/{nb_epoch}')
         net.train()
+        
+        # Progress bar 초기화
+        pbar = tqdm(trainloader, desc=f'Epoch {epoch+1}/{nb_epoch}')
+        
         train_loss = 0
-        train_loss1 = 0
-        train_loss2 = 0
-        train_loss3 = 0
-        train_loss4 = 0
-        train_loss5 = 0
-        correct = 0
-        total = 0
-        idx = 0
-        for batch_idx, (inputs, targets) in enumerate(trainloader):
-            idx = batch_idx
+        train_loss1 = train_loss2 = train_loss3 = train_loss4 = train_loss5 = 0
+        correct = total = 0
+        
+        for batch_idx, (inputs, targets) in enumerate(pbar):
             if inputs.shape[0] < batch_size:
                 continue
-            
+                
             inputs, targets = inputs.to(device), targets.to(device)
             
+            # Learning rate 조정
             for nlr in range(len(optimizer.param_groups)):
                 optimizer.param_groups[nlr]['lr'] = cosine_anneal_schedule(epoch, nb_epoch, lr[nlr])
 
@@ -362,144 +381,155 @@ def train(nb_epoch, batch_size, store_name, num_class=0, start_epoch=0, data_pat
                 random_order=True
             )
 
+            # Mixed Precision Training with H1-H4 steps
             # H1
-            # H1 first forward-backward step
-            enable_running_stats(netp)
-            optimizer.zero_grad()
-            inputs1_gt = img_add_noise(inputs, trans_seq_aug).to(device)
-            inputs1 = img_add_noise(inputs1_gt, trans_seq).to(device)
-            output_1, _, _, _, map1, _, _ = netp(inputs1)
-            loss1_c = CELoss(output_1, targets).mean() * 1
+            with autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
+                enable_running_stats(netp)
+                optimizer.zero_grad()
+                inputs1_gt = img_add_noise(inputs, trans_seq_aug).to(device)
+                inputs1 = img_add_noise(inputs1_gt, trans_seq).to(device)
+                output_1, _, _, _, map1, _, _ = netp(inputs1)
+                loss1_c = CELoss(output_1, targets).mean()
+                
+                inputs1_syn = decoder1(inputs1, map1)
+                loss1_g = CB_loss(inputs1_syn, inputs1_gt)
+                
+                output_1_syn, _, _, _, _, _, _ = netp(inputs1_syn)
+                loss1_c_syn = CELoss(output_1_syn, targets).mean()
+                
+                loss1 = loss1_c + (alpha * loss1_g) + loss1_c_syn
 
-            inputs1_syn = decoder1(inputs1, map1)
-            loss1_g = CB_loss(inputs1_syn, inputs1_gt) * 1
-
-            output_1_syn, _, _, _, _, _, _ = netp(inputs1_syn)
-            loss1_c_syn = CELoss(output_1_syn, targets).mean() * 1
-
-            loss1 = loss1_c + (alpha * loss1_g) + loss1_c_syn
-            loss1.backward()
+            scaler.scale(loss1).backward(retain_graph=True)
             optimizer.first_step(zero_grad=True)
 
+            # H1 second step
+            with autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
+                disable_running_stats(netp)
+                output_1, _, _, _, map1, _, _ = netp(inputs1)
+                loss1_c = CELoss(output_1, targets).mean()
+                
+                inputs1_syn = decoder1(inputs1, map1)
+                loss1_g = CB_loss(inputs1_syn, inputs1_gt)
+                
+                output_1_syn, _, _, _, _, _, _ = netp(inputs1_syn)
+                loss1_c_syn = CELoss(output_1_syn, targets).mean()
+                
+                loss1_ = loss1_c + (alpha * loss1_g) + loss1_c_syn
 
-            # H1 second forward-backward step
-            disable_running_stats(netp)
-            optimizer.zero_grad()
-
-            output_1, _, _, _, map1, _, _ = netp(inputs1)
-            loss1_c = CELoss(output_1, targets).mean() * 1
-
-            inputs1_syn = decoder1(inputs1, map1)
-            loss1_g = CB_loss(inputs1_syn, inputs1_gt) * 1
-
-            output_1_syn, _, _, _, _, _, _ = netp(inputs1_syn)
-            loss1_c_syn = CELoss(output_1_syn, targets).mean() * 1
-
-            loss1_ = loss1_c + (alpha * loss1_g) + loss1_c_syn
-            loss1_.backward()
+            scaler.scale(loss1_).backward()
             optimizer.second_step(zero_grad=True)
-
 
             # H2
             # H2 first forward-backward step
-            enable_running_stats(netp)
-            optimizer.zero_grad()
-            inputs2_gt = img_add_noise(inputs, trans_seq_aug).to(device)
-            inputs2 = img_add_noise(inputs2_gt, trans_seq).to(device)
-            _, output_2, _, _, _, map2, _ = netp(inputs2)
-            loss2_c = CELoss(output_2, targets).mean() * 1
+            with autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
+                enable_running_stats(netp)
+                optimizer.zero_grad()
+                inputs2_gt = img_add_noise(inputs, trans_seq_aug).to(device)
+                inputs2 = img_add_noise(inputs2_gt, trans_seq).to(device)
+                _, output_2, _, _, _, map2, _ = netp(inputs2)
+                loss2_c = CELoss(output_2, targets).mean()
+                
+                inputs2_syn = decoder2(inputs2, map2)
+                loss2_g = CB_loss(inputs2_syn, inputs2_gt)
+                
+                _, output_2_syn, _, _, _, _, _ = netp(inputs2_syn)
+                loss2_c_syn = CELoss(output_2_syn, targets).mean()
+                
+                loss2 = loss2_c + (alpha * loss2_g) + loss2_c_syn
 
-            inputs2_syn = decoder2(inputs2, map2)
-            loss2_g = CB_loss(inputs2_syn, inputs2_gt) * 1
-
-            _, output_2_syn, _, _, _, _, _ = netp(inputs2_syn)
-            loss2_c_syn = CELoss(output_2_syn, targets).mean() * 1
-
-            loss2 = loss2_c + (alpha * loss2_g) + loss2_c_syn
-            loss2.backward()
+            scaler.scale(loss2).backward(retain_graph=True)
             optimizer.first_step(zero_grad=True)
 
             # H2 second forward-backward step
-            disable_running_stats(netp)
-            optimizer.zero_grad()
-            _, output_2, _, _, _, map2, _ = netp(inputs2)
-            loss2_c = CELoss(output_2, targets).mean() * 1
+            with autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
+                disable_running_stats(netp)
+                output_2, _, _, _, _, map2, _ = netp(inputs2)
+                loss2_c = CELoss(output_2, targets).mean()
+                
+                inputs2_syn = decoder2(inputs2, map2)
+                loss2_g = CB_loss(inputs2_syn, inputs2_gt)
+                
+                _, output_2_syn, _, _, _, _, _ = netp(inputs2_syn)
+                loss2_c_syn = CELoss(output_2_syn, targets).mean()
+                
+                loss2_ = loss2_c + (alpha * loss2_g) + loss2_c_syn
 
-            inputs2_syn = decoder2(inputs2, map2)
-            loss2_g = CB_loss(inputs2_syn, inputs2_gt) * 1
-
-            _, output_2_syn, _, _, _, _, _ = netp(inputs2_syn)
-            loss2_c_syn = CELoss(output_2_syn, targets).mean() * 1
-
-            loss2_ = loss2_c + (alpha * loss2_g) + loss2_c_syn
-            loss2_.backward()
+            scaler.scale(loss2_).backward()
             optimizer.second_step(zero_grad=True)
 
             #H3
             # H3 first forward-backward step
-            enable_running_stats(netp)
-            optimizer.zero_grad()
-            inputs3_gt = img_add_noise(inputs, trans_seq_aug).to(device)
-            inputs3 = img_add_noise(inputs3_gt, trans_seq).to(device)
-            _, _, output_3, _, _, _, map3 = netp(inputs3)
-            loss3_c = CELoss(output_3, targets).mean() * 1
+            with autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
+                enable_running_stats(netp)
+                optimizer.zero_grad()
+                inputs3_gt = img_add_noise(inputs, trans_seq_aug).to(device)
+                inputs3 = img_add_noise(inputs3_gt, trans_seq).to(device)
+                _, _, output_3, _, _, _, map3 = netp(inputs3)
+                loss3_c = CELoss(output_3, targets).mean()
+                
+                inputs3_syn = decoder3(inputs3, map3)
+                loss3_g = CB_loss(inputs3_syn, inputs3_gt)
+                
+                _, _, output_3_syn, _, _, _, _ = netp(inputs3_syn)
+                loss3_c_syn = CELoss(output_3_syn, targets).mean()
+                
+                loss3 = loss3_c + (alpha * loss3_g) + loss3_c_syn
 
-            inputs3_syn = decoder3(inputs3, map3)
-            loss3_g = CB_loss(inputs3_syn, inputs3_gt) * 1
-
-            _, _, output_3_syn, _, _, _, _ = netp(inputs3_syn)
-            loss3_c_syn = CELoss(output_3_syn, targets).mean() * 1
-
-            loss3 = loss3_c + (alpha * loss3_g) + loss3_c_syn
-            loss3.backward()
+            scaler.scale(loss3).backward(retain_graph=True)
             optimizer.first_step(zero_grad=True)
 
             # H3 second forward-backward step
-            disable_running_stats(netp)
-            optimizer.zero_grad()
-            _, _, output_3, _, _, _, map3 = netp(inputs3)
-            loss3_c = CELoss(output_3, targets).mean() * 1
+            with autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
+                disable_running_stats(netp)
+                _, _, output_3, _, _, _, map3 = netp(inputs3)
+                loss3_c = CELoss(output_3, targets).mean()
+                
+                inputs3_syn = decoder3(inputs3, map3)
+                loss3_g = CB_loss(inputs3_syn, inputs3_gt)
+                
+                _, _, output_3_syn, _, _, _, _ = netp(inputs3_syn)
+                loss3_c_syn = CELoss(output_3_syn, targets).mean()
+                
+                loss3_ = loss3_c + (alpha * loss3_g) + loss3_c_syn
 
-            inputs3_syn = decoder3(inputs3, map3)
-            loss3_g = CB_loss(inputs3_syn, inputs3_gt) * 1
-
-            _, _, output_3_syn, _, _, _, _ = netp(inputs3_syn)
-            loss3_c_syn = CELoss(output_3_syn, targets).mean() * 1
-
-            loss3_ = loss3_c + (alpha * loss3_g) + loss3_c_syn
-            loss3_.backward()
+            scaler.scale(loss3_).backward()
             optimizer.second_step(zero_grad=True)
 
 
 
             # H4
             # H4 first forward-backward step
-            enable_running_stats(netp)
-            optimizer.zero_grad()
-            output_1_final, output_2_final, output_3_final, output_ORI, _, _, _ = netp(inputs)
-            ORI_loss = CELoss(output_1_final, targets).mean() + \
-                                CELoss(output_2_final, targets).mean() + \
-                                CELoss(output_3_final, targets).mean() + \
-                                CELoss(output_ORI, targets).mean() * 2
-            ORI_loss.backward()
+            with autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
+                enable_running_stats(netp)
+                optimizer.zero_grad()
+                output_1_final, output_2_final, output_3_final, output_ORI, _, _, _ = netp(inputs)
+                ORI_loss = CELoss(output_1_final, targets).mean() + \
+                                    CELoss(output_2_final, targets).mean() + \
+                                    CELoss(output_3_final, targets).mean() + \
+                                    CELoss(output_ORI, targets).mean() * 2
+
+            scaler.scale(ORI_loss).backward(retain_graph=True)
             optimizer.first_step(zero_grad=True)
 
             # H4 second forward-backward step
-            disable_running_stats(netp)
-            optimizer.zero_grad()
-            output_1_final, output_2_final, output_3_final, output_ORI, _, _, _ = netp(inputs)
-            ORI_loss_ = CELoss(output_1_final, targets).mean() + \
-                          CELoss(output_2_final, targets).mean() + \
-                          CELoss(output_3_final, targets).mean() + \
-                          CELoss(output_ORI, targets).mean() * 2
-            ORI_loss_.backward()
+            with autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
+                disable_running_stats(netp)
+                output_1_final, output_2_final, output_3_final, output_ORI, _, _, _ = netp(inputs)
+                ORI_loss_ = CELoss(output_1_final, targets).mean() + \
+                              CELoss(output_2_final, targets).mean() + \
+                              CELoss(output_3_final, targets).mean() + \
+                              CELoss(output_ORI, targets).mean() * 2
+
+            scaler.scale(ORI_loss_).backward()
             optimizer.second_step(zero_grad=True)
 
 
+            # Update metrics
             _, predicted = torch.max(output_ORI.data, 1)
             total += targets.size(0)
             correct += predicted.eq(targets.data).cpu().sum()
 
+            # Loss accumulation
             train_loss += (loss1.item() + loss2.item() + loss3.item() + ORI_loss.item())
             train_loss1 += loss1.item()
             train_loss2 += loss2.item()
@@ -507,41 +537,50 @@ def train(nb_epoch, batch_size, store_name, num_class=0, start_epoch=0, data_pat
             train_loss4 += (loss1_g.item() + loss2_g.item() + loss3_g.item())
             train_loss5 += ORI_loss.item()
 
-            if batch_idx % 50 == 0:
-                print(
-                    'Step: %d | Loss1: %.3f | Loss2: %.5f | Loss3: %.5f | Loss_Gen: %.5f |Loss_ORI: %.5f | Loss: %.3f | Acc: %.3f%% (%d/%d)' % (
-                    batch_idx, train_loss1 / (batch_idx + 1), train_loss2 / (batch_idx + 1),
-                    train_loss3 / (batch_idx + 1), train_loss4 / (batch_idx + 1),  train_loss5/ (batch_idx + 1), train_loss / (batch_idx + 1),
-                    100. * float(correct) / total, correct, total))
+            # Update progress bar
+            pbar.set_postfix({
+                'Loss': f'{train_loss/(batch_idx+1):.3f}',
+                'Acc': f'{100.*float(correct)/total:.2f}%'
+            })
 
+            # Log to tensorboard
+            writer.add_scalar('Batch/Loss', train_loss/(batch_idx+1), epoch * len(trainloader) + batch_idx)
+            writer.add_scalar('Batch/Accuracy', 100.*float(correct)/total, epoch * len(trainloader) + batch_idx)
+
+        # Epoch end operations
         train_acc = 100. * float(correct) / total
-        train_loss = train_loss / (idx + 1)
-        with open(exp_dir + '/results_train.txt', 'a') as file:
-            file.write(
-                'Iteration %d | train_acc = %.5f | train_loss = %.5f | Loss1: %.3f | Loss2: %.5f | Loss3: %.5f | Loss_Gen: %.5f | Loss_ORI: %.5f |\n' % (
-                epoch, train_acc, train_loss, train_loss1 / (idx + 1), train_loss2 / (idx + 1), train_loss3 / (idx + 1),
-                train_loss4 / (idx + 1), train_loss5 / (idx + 1)))
+        train_loss = train_loss / len(trainloader)
+        
+        # Validation
+        val_acc_com, val_loss = test(net, CELoss, batch_size, data_path+'/test')
+        
+        # Log to tensorboard
+        writer.add_scalars('Epoch', {
+            'Train_Loss': train_loss,
+            'Train_Acc': train_acc,
+            'Val_Loss': val_loss,
+            'Val_Acc': val_acc_com
+        }, epoch)
 
-
-        val_acc_com, val_loss = test(net, CELoss, 7, data_path+'/test')
+        # Save best model
         if val_acc_com > max_val_acc:
             max_val_acc = val_acc_com
-            net.cpu()
-            decoder1.cpu()
-            decoder2.cpu()
-            decoder3.cpu()
-            torch.save(net, './' + store_name + '/model.pth')
-            torch.save(decoder1, './' + store_name + '/decoder1.pth')
-            torch.save(decoder2, './' + store_name + '/decoder2.pth')
-            torch.save(decoder3, './' + store_name + '/decoder3.pth')
-            net.to(device)
-            decoder1.to(device)
-            decoder2.to(device)
-            decoder3.to(device)
-        with open(exp_dir + '/results_test.txt', 'a') as file:
-            file.write('Iteration %d, test_acc_combined = %.5f, test_loss = %.6f\n' % (
-            epoch, val_acc_com, val_loss))
+            save_checkpoint({
+                'epoch': epoch,
+                'state_dict': net.state_dict(),
+                'decoder1': decoder1.state_dict(),
+                'decoder2': decoder2.state_dict(),
+                'decoder3': decoder3.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'max_val_acc': max_val_acc,
+            }, store_name)
 
+    writer.close()
+
+def save_checkpoint(state, store_name):
+    """Save checkpoint"""
+    filepath = os.path.join(store_name, 'checkpoint.pth')
+    torch.save(state, filepath)
 
 if __name__ == '__main__':
     data_path = '/data/Stanford_Cars'
